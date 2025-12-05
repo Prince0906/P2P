@@ -141,6 +141,9 @@ class TransferProtocol:
     Low-level transfer protocol handler.
     
     Handles sending/receiving messages over TCP.
+    
+    Thread-safe: Uses a lock to ensure only one request/response
+    pair is active at a time per connection.
     """
     
     def __init__(self, reader: asyncio.StreamReader, 
@@ -148,6 +151,8 @@ class TransferProtocol:
         self.reader = reader
         self.writer = writer
         self._closed = False
+        # Lock to prevent concurrent reads/writes on the same connection
+        self._lock = asyncio.Lock()
     
     @property
     def remote_address(self) -> Tuple[str, int]:
@@ -185,20 +190,24 @@ class TransferProtocol:
         Returns:
             Chunk data, or None if not found/error
         """
-        request = TransferMessage(
-            type=TransferMessageType.REQUEST_CHUNK,
-            headers={'chunk_hash': chunk_hash}
-        )
-        await self.send(request)
-        
-        response = await self.receive()
-        if response is None:
+        # Use lock to ensure request/response pair is atomic
+        async with self._lock:
+            request = TransferMessage(
+                type=TransferMessageType.REQUEST_CHUNK,
+                headers={'chunk_hash': chunk_hash}
+            )
+            data = request.to_bytes()
+            self.writer.write(data)
+            await self.writer.drain()
+            
+            response = await TransferMessage.from_reader(self.reader)
+            if response is None:
+                return None
+            
+            if response.type == TransferMessageType.CHUNK_DATA:
+                return response.data
+            
             return None
-        
-        if response.type == TransferMessageType.CHUNK_DATA:
-            return response.data
-        
-        return None
     
     async def request_manifest(self, info_hash: str) -> Optional[str]:
         """
@@ -207,54 +216,70 @@ class TransferProtocol:
         Returns:
             Manifest JSON string, or None if not found
         """
-        request = TransferMessage(
-            type=TransferMessageType.REQUEST_MANIFEST,
-            headers={'info_hash': info_hash}
-        )
-        await self.send(request)
-        
-        response = await self.receive()
-        if response is None:
+        # Use lock to ensure request/response pair is atomic
+        async with self._lock:
+            request = TransferMessage(
+                type=TransferMessageType.REQUEST_MANIFEST,
+                headers={'info_hash': info_hash}
+            )
+            data = request.to_bytes()
+            self.writer.write(data)
+            await self.writer.drain()
+            
+            response = await TransferMessage.from_reader(self.reader)
+            if response is None:
+                return None
+            
+            if response.type == TransferMessageType.MANIFEST_DATA:
+                return response.data.decode('utf-8')
+            
             return None
-        
-        if response.type == TransferMessageType.MANIFEST_DATA:
-            return response.data.decode('utf-8')
-        
-        return None
     
     async def send_chunk(self, chunk_hash: str, data: bytes):
         """Send a chunk to the peer."""
-        message = TransferMessage(
-            type=TransferMessageType.CHUNK_DATA,
-            headers={'chunk_hash': chunk_hash},
-            data=data
-        )
-        await self.send(message)
+        async with self._lock:
+            message = TransferMessage(
+                type=TransferMessageType.CHUNK_DATA,
+                headers={'chunk_hash': chunk_hash},
+                data=data
+            )
+            data_bytes = message.to_bytes()
+            self.writer.write(data_bytes)
+            await self.writer.drain()
     
     async def send_chunk_not_found(self, chunk_hash: str):
         """Send chunk not found response."""
-        message = TransferMessage(
-            type=TransferMessageType.CHUNK_NOT_FOUND,
-            headers={'chunk_hash': chunk_hash}
-        )
-        await self.send(message)
+        async with self._lock:
+            message = TransferMessage(
+                type=TransferMessageType.CHUNK_NOT_FOUND,
+                headers={'chunk_hash': chunk_hash}
+            )
+            data = message.to_bytes()
+            self.writer.write(data)
+            await self.writer.drain()
     
     async def send_manifest(self, info_hash: str, manifest_json: str):
         """Send a manifest to the peer."""
-        message = TransferMessage(
-            type=TransferMessageType.MANIFEST_DATA,
-            headers={'info_hash': info_hash},
-            data=manifest_json.encode('utf-8')
-        )
-        await self.send(message)
+        async with self._lock:
+            message = TransferMessage(
+                type=TransferMessageType.MANIFEST_DATA,
+                headers={'info_hash': info_hash},
+                data=manifest_json.encode('utf-8')
+            )
+            data = message.to_bytes()
+            self.writer.write(data)
+            await self.writer.drain()
     
     async def send_manifest_not_found(self, info_hash: str):
         """Send manifest not found response."""
-        message = TransferMessage(
-            type=TransferMessageType.MANIFEST_NOT_FOUND,
-            headers={'info_hash': info_hash}
-        )
-        await self.send(message)
+        async with self._lock:
+            message = TransferMessage(
+                type=TransferMessageType.MANIFEST_NOT_FOUND,
+                headers={'info_hash': info_hash}
+            )
+            data = message.to_bytes()
+            self.writer.write(data)
+            await self.writer.drain()
 
 
 # Type for request handlers
