@@ -11,8 +11,8 @@
 ### 1. Install Backend Dependencies
 
 ```bash
-# Navigate to project root
-cd /Users/princesahoo/CODE/p2p
+# Navigate to backend directory
+cd /Users/princesahoo/CODE/p2p/backend
 
 # Create virtual environment (if not already created)
 python3.12 -m venv venv
@@ -29,9 +29,14 @@ pip install -r requirements.txt
 **Open Terminal 1:**
 
 ```bash
-cd /Users/princesahoo/CODE/p2p
+cd /Users/princesahoo/CODE/p2p/backend
 source venv/bin/activate
 python cli.py start
+```
+
+**Note:** If `python` command is not found after activation, use `python3` instead:
+```bash
+python3 cli.py start
 ```
 
 You should see:
@@ -99,13 +104,13 @@ Now you can:
 ## Testing with Multiple Laptops
 
 ### On Laptop 1:
-1. Start backend: `python cli.py start`
+1. Start backend: `cd backend && source venv/bin/activate && python cli.py start`
 2. Start frontend: `cd frontend && npm run dev`
 3. Upload a file
 4. Copy the share link
 
 ### On Laptop 2:
-1. Start backend: `python cli.py start`
+1. Start backend: `cd backend && source venv/bin/activate && python cli.py start`
 2. Start frontend: `cd frontend && npm run dev`
 3. Paste the share link from Laptop 1
 4. File downloads automatically!
@@ -136,7 +141,9 @@ Now you can:
 ## Quick Commands Reference
 
 ```bash
-# Backend
+# Backend (from backend/ directory)
+cd backend
+source venv/bin/activate
 python cli.py start                    # Start node
 python cli.py share /path/to/file      # Share file (CLI)
 python cli.py download <hash>         # Download file (CLI)
