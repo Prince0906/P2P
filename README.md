@@ -12,12 +12,14 @@ A decentralized file sharing system using Kademlia DHT, designed for university 
 
 ## Quick Start
 
+### Backend (CLI)
+
 ```bash
 # Install dependencies
 pip install -r requirements.txt
 
 # Start a node
-python cli.py start --port 8000
+python cli.py start
 
 # Share a file
 python cli.py share /path/to/file.pdf
@@ -25,6 +27,35 @@ python cli.py share /path/to/file.pdf
 # Download a file (using its hash)
 python cli.py download <file_hash> --output ./downloads/
 ```
+
+### Frontend (Web Interface)
+
+```bash
+# Navigate to frontend directory
+cd frontend
+
+# Install dependencies
+npm install
+
+# Create .env.local file
+echo "NEXT_PUBLIC_API_URL=http://localhost:8080" > .env.local
+echo "API_URL=http://localhost:8080" >> .env.local
+
+# Make sure backend is running (in another terminal)
+# python cli.py start
+
+# Start frontend
+npm run dev
+
+# Open http://localhost:3000
+```
+
+The frontend provides:
+- 📤 **Drag & drop file upload**
+- 📥 **Easy file downloads** (no hash copy-paste needed!)
+- 📊 **Real-time activity log** showing every step (perfect for demos!)
+- 📱 **QR code sharing** for easy file distribution
+- 🔍 **Peer and DHT node visualization**
 
 ## Architecture
 

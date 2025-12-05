@@ -30,6 +30,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File
 from fastapi.responses import JSONResponse, FileResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
@@ -106,6 +107,15 @@ def create_app(node=None) -> FastAPI:
         description="REST API for the DHT-based P2P file sharing system",
         version="1.0.0",
         lifespan=lifespan,
+    )
+    
+    # Add CORS middleware to allow frontend connections
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],  # Next.js default port
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
     )
     
     # === Endpoints ===
