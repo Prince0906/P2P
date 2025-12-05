@@ -265,4 +265,3 @@ export default function FileList({ onDownload, onLog }: FileListProps) {
     </div>
   );
 }
-
