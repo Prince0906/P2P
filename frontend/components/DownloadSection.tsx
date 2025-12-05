@@ -28,11 +28,34 @@ export default function DownloadSection({ onLog }: DownloadSectionProps) {
   const handleDownload = async () => {
     if (!infoHash.trim() || downloading) return;
 
-    const hash = infoHash.trim();
-    if (hash.length !== 64) {
-      addLog('error', 'Invalid info hash. Must be 64 hexadecimal characters.');
+    // Clean and validate the hash (handles URLs, just hash, etc.)
+    let hash = infoHash.trim();
+    
+    // If it's a full URL, extract the hash from the path
+    if (hash.includes('://') || hash.startsWith('/download/')) {
+      const urlMatch = hash.match(/\/download\/([0-9a-fA-F]{64})/i);
+      if (urlMatch && urlMatch[1]) {
+        hash = urlMatch[1];
+      } else {
+        // Try to extract any 64-char hex string from the URL
+        const hexMatch = hash.match(/([0-9a-fA-F]{64})/i);
+        if (hexMatch && hexMatch[1]) {
+          hash = hexMatch[1];
+        }
+      }
+    }
+    
+    // Remove any query parameters or fragments
+    hash = hash.split('?')[0].split('#')[0];
+    
+    // Validate: must be exactly 64 hex characters
+    if (hash.length !== 64 || !/^[0-9a-fA-F]{64}$/.test(hash)) {
+      addLog('error', `Invalid info hash. Must be exactly 64 hexadecimal characters. Got: "${hash}" (length: ${hash.length})`);
       return;
     }
+    
+    // Normalize to lowercase
+    hash = hash.toLowerCase();
 
     setDownloading(true);
     addLog('info', `Starting download for hash: ${hash.substring(0, 16)}...`, 1, 5);

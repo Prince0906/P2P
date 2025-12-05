@@ -5,12 +5,13 @@ import { useParams, useRouter } from 'next/navigation';
 import { Download, Loader2, CheckCircle2, XCircle, ArrowLeft } from 'lucide-react';
 import { apiClient } from '@/lib/api';
 import StatusLog, { LogEntry } from '@/components/StatusLog';
-import { generateUniqueId } from '@/lib/utils';
+import { generateUniqueId, cleanInfoHash } from '@/lib/utils';
 
 export default function DownloadPage() {
   const params = useParams();
   const router = useRouter();
-  const infoHash = params.hash as string;
+  const rawHash = params.hash as string;
+  const infoHash = cleanInfoHash(rawHash);
   
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [downloading, setDownloading] = useState(false);
@@ -52,7 +53,7 @@ export default function DownloadPage() {
   };
 
   useEffect(() => {
-    if (infoHash && infoHash.length === 64) {
+    if (infoHash) {
       addLog('info', `Download page opened for file: ${infoHash.substring(0, 16)}...`, 1, 5);
       addLog('loading', 'Validating info hash...', 2, 5);
       
@@ -65,13 +66,16 @@ export default function DownloadPage() {
       
       return () => clearTimeout(timer);
     } else {
-      setError('Invalid info hash format');
-      addLog('error', 'Invalid info hash. Must be 64 hexadecimal characters.');
+      // cleanInfoHash should have extracted the hash from URL if it was a full URL
+      // If it's still null, show a helpful error
+      const errorMsg = `Invalid info hash format. Received: "${rawHash?.substring(0, 100)}${rawHash && rawHash.length > 100 ? '...' : ''}" (length: ${rawHash?.length || 0}). Must be exactly 64 hexadecimal characters. If you pasted a full URL, make sure it contains a valid 64-character hash.`;
+      setError(errorMsg);
+      addLog('error', errorMsg);
     }
-  }, [infoHash]);
+  }, [infoHash, rawHash]);
 
   const handleDownload = async () => {
-    if (downloading || completed) return;
+    if (downloading || completed || !infoHash) return;
 
     setDownloading(true);
     setError(null);
@@ -85,6 +89,7 @@ export default function DownloadPage() {
       // Step 4: Finding peers and downloading
       addLog('loading', 'Finding peers and downloading chunks...', 4, 5);
       
+      // Use the cleaned and validated hash
       const response = await apiClient.downloadFile(infoHash);
       
       // Step 4 completed
@@ -115,7 +120,12 @@ export default function DownloadPage() {
             Back to Home
           </button>
           <h1 className="text-3xl font-bold text-gray-900">Download File</h1>
-          <p className="mt-2 text-gray-600 font-mono text-sm">{infoHash}</p>
+          {infoHash && (
+            <p className="mt-2 text-gray-600 font-mono text-sm break-all">{infoHash}</p>
+          )}
+          {!infoHash && rawHash && (
+            <p className="mt-2 text-red-600 font-mono text-sm break-all">Invalid hash: {rawHash}</p>
+          )}
         </div>
       </header>
 
