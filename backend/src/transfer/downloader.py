@@ -40,6 +40,7 @@ import asyncio
 import logging
 import time
 import hashlib
+import random
 from typing import Optional, List, Tuple, Dict, Set, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -52,13 +53,44 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class ChunkState:
+    """Track individual chunk download state for visualization."""
+    chunk_hash: str
+    chunk_index: int
+    status: str = 'pending'  # 'pending', 'downloading', 'complete', 'failed'
+    peer_ip: Optional[str] = None
+    peer_port: Optional[int] = None
+    size: int = 0
+    downloaded_at: Optional[float] = None
+
+
+@dataclass
+class PeerState:
+    """Track peer contribution for visualization."""
+    ip: str
+    port: int
+    chunks_assigned: int = 0
+    chunks_completed: int = 0
+    chunks_failed: int = 0
+    bytes_downloaded: int = 0
+    is_active: bool = True
+
+
+@dataclass
 class DownloadProgress:
-    """Track download progress."""
+    """Track download progress with detailed chunk/peer info for visualization."""
     total_chunks: int
     downloaded_chunks: int = 0
     failed_chunks: int = 0
     bytes_downloaded: int = 0
     start_time: float = field(default_factory=time.time)
+    
+    # Detailed tracking for visualization
+    chunk_states: Dict[str, ChunkState] = field(default_factory=dict)  # hash -> ChunkState
+    peer_states: Dict[str, PeerState] = field(default_factory=dict)    # "ip:port" -> PeerState
+    phase: str = 'initializing'  # 'initializing', 'finding_peers', 'downloading', 'merging', 'complete', 'failed'
+    file_name: str = ''
+    file_size: int = 0
     
     @property
     def progress(self) -> float:
@@ -84,10 +116,47 @@ class DownloadProgress:
         if elapsed == 0:
             return 0
         return self.bytes_downloaded / elapsed
+    
+    def to_dict(self) -> dict:
+        """Convert to dictionary for JSON serialization."""
+        return {
+            'total_chunks': self.total_chunks,
+            'downloaded_chunks': self.downloaded_chunks,
+            'failed_chunks': self.failed_chunks,
+            'bytes_downloaded': self.bytes_downloaded,
+            'progress_percent': self.progress_percent,
+            'speed_bytes_per_sec': self.speed_bytes_per_sec,
+            'elapsed_seconds': self.elapsed_seconds,
+            'phase': self.phase,
+            'file_name': self.file_name,
+            'file_size': self.file_size,
+            'chunks': [
+                {
+                    'index': cs.chunk_index,
+                    'hash': cs.chunk_hash[:16],
+                    'status': cs.status,
+                    'peer': f"{cs.peer_ip}:{cs.peer_port}" if cs.peer_ip else None,
+                }
+                for cs in sorted(self.chunk_states.values(), key=lambda x: x.chunk_index)
+            ],
+            'peers': [
+                {
+                    'ip': ps.ip,
+                    'port': ps.port,
+                    'chunks_assigned': ps.chunks_assigned,
+                    'chunks_completed': ps.chunks_completed,
+                    'chunks_failed': ps.chunks_failed,
+                    'bytes_downloaded': ps.bytes_downloaded,
+                    'is_active': ps.is_active,
+                }
+                for ps in self.peer_states.values()
+            ],
+        }
 
 
 # Progress callback type
 ProgressCallback = Callable[[DownloadProgress], None]
+
 
 
 class ChunkDownloader:
@@ -240,7 +309,13 @@ class FileDownloader:
                            progress_callback: ProgressCallback = None,
                            output_path: Path = None) -> Optional[Path]:
         """
-        Download a complete file.
+        Download a complete file using multiple peers with load balancing.
+        
+        Load Balancing Strategy:
+        1. Shuffle peers - different downloaders get different peer order
+        2. Round-robin chunk assignment - distribute chunks across all peers
+        3. Parallel downloads from all peers simultaneously
+        4. Retry failed chunks with other peers
         
         Args:
             manifest: File manifest with chunk info
@@ -268,68 +343,219 @@ class FileDownloader:
         
         logger.info(f"Downloading {manifest.name}: {len(missing_chunks)}/{manifest.chunk_count} chunks needed")
         
-        # Initialize progress
+        # === LOAD BALANCING: Shuffle peers ===
+        # Each downloader gets a random order, preventing thundering herd
+        peers = list(peers)
+        random.shuffle(peers)
+        logger.debug(f"Peer order after shuffle: {[(p[0], p[1]) for p in peers[:3]]}...")
+        
+        # === LOAD BALANCING: Round-robin chunk assignment ===
+        # Distribute chunks evenly across all available peers
+        chunk_assignments = self._assign_chunks_round_robin(missing_chunks, peers)
+        
+        # Log chunk distribution
+        for peer, chunks in chunk_assignments.items():
+            logger.debug(f"Assigned {len(chunks)} chunks to {peer[0]}:{peer[1]}")
+        
+        # Build chunk index map for tracking
+        chunk_index_map = {}
+        for chunk_info in manifest.chunks:
+            chunk_index_map[chunk_info.hash] = (chunk_info.index, chunk_info.size)
+        
+        # Initialize progress with detailed tracking
         progress = DownloadProgress(
             total_chunks=len(missing_chunks),
             downloaded_chunks=0,
+            file_name=manifest.name,
+            file_size=manifest.size,
+            phase='finding_peers',
         )
         
-        # Create download tasks
-        semaphore = asyncio.Semaphore(self.max_concurrent)
+        # Initialize chunk states
+        for chunk_hash in missing_chunks:
+            idx, size = chunk_index_map.get(chunk_hash, (0, 0))
+            progress.chunk_states[chunk_hash] = ChunkState(
+                chunk_hash=chunk_hash,
+                chunk_index=idx,
+                status='pending',
+                size=size,
+            )
         
-        async def download_chunk_with_retry(chunk_hash: str) -> bool:
-            """Download a chunk with retry across peers."""
-            async with semaphore:
-                # Try each peer
-                for ip, port in peers:
-                    data = await self.chunk_downloader.download_chunk(
-                        ip, port, chunk_hash
-                    )
-                    
-                    if data:
-                        # Store the chunk
-                        success = await self.storage.store_chunk(chunk_hash, data)
-                        if success:
+        # Initialize peer states
+        for peer, chunks in chunk_assignments.items():
+            ip, port = peer
+            peer_key = f"{ip}:{port}"
+            progress.peer_states[peer_key] = PeerState(
+                ip=ip,
+                port=port,
+                chunks_assigned=len(chunks),
+            )
+        
+        # Notify about peers found
+        progress.phase = 'downloading'
+        if progress_callback:
+            progress_callback(progress)
+        
+        # Track failed chunks for retry
+        failed_chunks: List[str] = []
+        failed_lock = asyncio.Lock()
+        progress_lock = asyncio.Lock()  # Protect progress updates from race conditions
+        
+        async def download_from_peer(peer: Tuple[str, int], chunks: List[str]) -> None:
+            """Download assigned chunks from a specific peer."""
+            ip, port = peer
+            peer_key = f"{ip}:{port}"
+            
+            for chunk_hash in chunks:
+                # Mark chunk as downloading
+                async with progress_lock:
+                    if chunk_hash in progress.chunk_states:
+                        progress.chunk_states[chunk_hash].status = 'downloading'
+                        progress.chunk_states[chunk_hash].peer_ip = ip
+                        progress.chunk_states[chunk_hash].peer_port = port
+                    if progress_callback:
+                        progress_callback(progress)
+                
+                data = await self.chunk_downloader.download_chunk(ip, port, chunk_hash)
+                
+                if data:
+                    # Store chunk
+                    success = await self.storage.store_chunk(chunk_hash, data)
+                    if success:
+                        async with progress_lock:
                             progress.downloaded_chunks += 1
                             progress.bytes_downloaded += len(data)
                             
+                            # Update chunk state
+                            if chunk_hash in progress.chunk_states:
+                                progress.chunk_states[chunk_hash].status = 'complete'
+                                progress.chunk_states[chunk_hash].downloaded_at = time.time()
+                            
+                            # Update peer state
+                            if peer_key in progress.peer_states:
+                                progress.peer_states[peer_key].chunks_completed += 1
+                                progress.peer_states[peer_key].bytes_downloaded += len(data)
+                            
                             if progress_callback:
                                 progress_callback(progress)
-                            
-                            return True
-                
-                # All peers failed
-                progress.failed_chunks += 1
-                return False
+                else:
+                    # Mark chunk as failed and queue for retry
+                    async with progress_lock:
+                        if chunk_hash in progress.chunk_states:
+                            progress.chunk_states[chunk_hash].status = 'failed'
+                        if peer_key in progress.peer_states:
+                            progress.peer_states[peer_key].chunks_failed += 1
+                    async with failed_lock:
+                        failed_chunks.append(chunk_hash)
         
-        # Download all chunks
+        # Download from all peers in parallel
         tasks = [
-            download_chunk_with_retry(chunk_hash)
-            for chunk_hash in missing_chunks
+            download_from_peer(peer, chunks)
+            for peer, chunks in chunk_assignments.items()
+            if chunks  # Skip peers with no assigned chunks
         ]
         
-        results = await asyncio.gather(*tasks)
+        await asyncio.gather(*tasks)
+        
+        # === Retry failed chunks with other peers ===
+        if failed_chunks:
+            logger.info(f"Retrying {len(failed_chunks)} failed chunks with alternate peers")
+            
+            async def retry_chunk(chunk_hash: str) -> bool:
+                """Retry a chunk with all peers until success."""
+                for ip, port in peers:
+                    peer_key = f"{ip}:{port}"
+                    
+                    # Mark as retrying
+                    async with progress_lock:
+                        if chunk_hash in progress.chunk_states:
+                            progress.chunk_states[chunk_hash].status = 'downloading'
+                            progress.chunk_states[chunk_hash].peer_ip = ip
+                            progress.chunk_states[chunk_hash].peer_port = port
+                        if progress_callback:
+                            progress_callback(progress)
+                    
+                    data = await self.chunk_downloader.download_chunk(ip, port, chunk_hash)
+                    if data:
+                        success = await self.storage.store_chunk(chunk_hash, data)
+                        if success:
+                            async with progress_lock:
+                                progress.downloaded_chunks += 1
+                                progress.bytes_downloaded += len(data)
+                                if chunk_hash in progress.chunk_states:
+                                    progress.chunk_states[chunk_hash].status = 'complete'
+                                    progress.chunk_states[chunk_hash].downloaded_at = time.time()
+                                if peer_key in progress.peer_states:
+                                    progress.peer_states[peer_key].chunks_completed += 1
+                                    progress.peer_states[peer_key].bytes_downloaded += len(data)
+                                if progress_callback:
+                                    progress_callback(progress)
+                            return True
+                
+                # All peers failed for this chunk
+                async with progress_lock:
+                    if chunk_hash in progress.chunk_states:
+                        progress.chunk_states[chunk_hash].status = 'failed'
+                return False
+            
+            retry_tasks = [retry_chunk(ch) for ch in failed_chunks]
+            retry_results = await asyncio.gather(*retry_tasks)
+            
+            # Update failed count
+            progress.failed_chunks = sum(1 for r in retry_results if not r)
         
         # Close connections
         await self.chunk_downloader.close_all()
         
-        # Check results
-        success_count = sum(1 for r in results if r)
-        
-        if success_count < len(missing_chunks):
-            logger.error(f"Download incomplete: {success_count}/{len(missing_chunks)} chunks")
+        # Check if download complete
+        still_missing = await self.storage.get_missing_chunks(manifest)
+        if still_missing:
+            logger.error(f"Download incomplete: {len(still_missing)} chunks still missing")
+            progress.phase = 'failed'
+            if progress_callback:
+                progress_callback(progress)
             return None
         
         # Reassemble file
         logger.info(f"Download complete, reassembling {manifest.name}")
+        progress.phase = 'merging'
+        if progress_callback:
+            progress_callback(progress)
+        
         result_path = await self.storage.reassemble_file(manifest, output_path)
         
         if result_path:
             self.files_downloaded += 1
             self.total_bytes += manifest.size
             logger.info(f"File saved to {result_path}")
+            progress.phase = 'complete'
+            if progress_callback:
+                progress_callback(progress)
+        else:
+            progress.phase = 'failed'
+            if progress_callback:
+                progress_callback(progress)
         
         return result_path
+    
+    def _assign_chunks_round_robin(self, chunks: List[str], 
+                                   peers: List[Tuple[str, int]]) -> Dict[Tuple[str, int], List[str]]:
+        """
+        Distribute chunks across peers using round-robin assignment.
+        
+        Example with 10 chunks and 2 peers:
+            Peer A: chunks [0, 2, 4, 6, 8]
+            Peer B: chunks [1, 3, 5, 7, 9]
+        
+        This ensures even load distribution across all available peers.
+        """
+        assignments: Dict[Tuple[str, int], List[str]] = {peer: [] for peer in peers}
+        
+        for i, chunk_hash in enumerate(chunks):
+            peer = peers[i % len(peers)]
+            assignments[peer].append(chunk_hash)
+        
+        return assignments
     
     async def download_from_dht(self, dht_node, info_hash: str,
                                progress_callback: ProgressCallback = None,

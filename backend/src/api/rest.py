@@ -24,12 +24,13 @@ API Design:
 
 import asyncio
 import logging
+import json
 from pathlib import Path
 from typing import Optional, List
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -228,6 +229,96 @@ def create_app(node=None) -> FastAPI:
         except Exception as e:
             logger.error(f"Download error: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.get("/files/download/{info_hash}/stream", tags=["Files"])
+    async def download_file_stream(info_hash: str):
+        """
+        Download a file with SSE streaming progress.
+        
+        Returns Server-Sent Events with real-time progress including:
+        - Peer discovery status
+        - Per-chunk download status with source peer
+        - Merging phase
+        - Completion status
+        """
+        if not _node:
+            raise HTTPException(status_code=503, detail="Node not initialized")
+        
+        # Validate info_hash
+        info_hash = info_hash.strip().lower()
+        if len(info_hash) != 64 or not all(c in '0123456789abcdef' for c in info_hash):
+            raise HTTPException(status_code=400, detail="Invalid info_hash format")
+        
+        logger.info(f"SSE download request for: {info_hash[:16]}...")
+        
+        # Progress queue for SSE events
+        progress_queue = asyncio.Queue()
+        download_complete = asyncio.Event()
+        download_result = {'path': None, 'error': None}
+        
+        def progress_callback(progress):
+            """Push progress updates to SSE queue."""
+            try:
+                event_data = progress.to_dict()
+                progress_queue.put_nowait(event_data)
+            except Exception as e:
+                logger.error(f"Error serializing progress: {e}")
+        
+        async def run_download():
+            """Run download in background."""
+            try:
+                result = await _node.download(info_hash, progress_callback=progress_callback)
+                download_result['path'] = str(result) if result else None
+            except Exception as e:
+                download_result['error'] = str(e)
+            finally:
+                download_complete.set()
+        
+        async def event_generator():
+            """Generate SSE events."""
+            # Start download task
+            download_task = asyncio.create_task(run_download())
+            
+            # Send initial event
+            yield f"data: {json.dumps({'phase': 'initializing', 'message': 'Starting download...'})}\n\n"
+            
+            try:
+                while not download_complete.is_set():
+                    try:
+                        # Wait for progress update or timeout
+                        event_data = await asyncio.wait_for(
+                            progress_queue.get(),
+                            timeout=0.5
+                        )
+                        yield f"data: {json.dumps(event_data)}\n\n"
+                    except asyncio.TimeoutError:
+                        # Send heartbeat
+                        yield f": heartbeat\n\n"
+                
+                # Drain remaining events
+                while not progress_queue.empty():
+                    event_data = progress_queue.get_nowait()
+                    yield f"data: {json.dumps(event_data)}\n\n"
+                
+                # Send final result
+                if download_result['error']:
+                    yield f"data: {json.dumps({'phase': 'error', 'error': download_result['error']})}\n\n"
+                else:
+                    yield f"data: {json.dumps({'phase': 'complete', 'file_path': download_result['path']})}\n\n"
+                    
+            except asyncio.CancelledError:
+                download_task.cancel()
+                raise
+        
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            }
+        )
     
     @app.get("/files", response_model=List[FileInfo], tags=["Files"])
     async def list_files():
